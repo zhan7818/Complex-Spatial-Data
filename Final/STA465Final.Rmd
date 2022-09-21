@@ -1,0 +1,2327 @@
+---
+title: "STA465 Final Exam"
+author: "Tianyi Zhang"
+date: "29/04/2022"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## load in the R packages needed and data
+library(geoR)
+library(sf)
+library(tidyverse)
+library(sp)
+library(rgdal)
+library(tmap)
+library(raster)
+library(geodist)
+library(INLA)
+
+# knitr and kableExtra for tables
+library(knitr)
+library(kableExtra)
+
+# leftlet for maps
+library(leaflet)
+
+# Data extraction and conversion modified from MalariaPrevalence.Rmd in Lab 7
+data(gambia)
+
+## aggregate by location and convert the object into a 'sf' object
+d <- group_by(gambia, x, y) %>%
+  summarize(
+    total = n(),
+    positive = sum(pos),
+    prev = positive / total
+  )
+
+sps <- SpatialPoints(d[, c("x", "y")],
+  proj4string = CRS("+proj=utm +zone=28")
+)
+spst <- spTransform(sps, CRS("+proj=longlat +datum=WGS84"))
+d[,c("long", "lat")] <- spst@coords
+r <- getData(name = "alt", country = "GMB", mask = TRUE) # altitude data of Gambia
+d$alt <- raster::extract(r, d[, c("long", "lat")])
+
+## Find and fill the missing altitudes
+r_sen <- getData(name = "alt", country = "SEN", mask = TRUE)
+
+sen_alt <- raster::extract(r_sen, d[, c("long", "lat")])
+
+d$alt[25] <- 31
+d$alt[64] <- 20
+
+gambia.sf <- st_as_sf(d, coords = c("long", "lat"), crs = "+proj=longlat +datum=WGS84")
+
+
+## map of the prevalence data
+#tm_shape(gambia.sf) + tm_dots("prev", title = "Prevalence") 
+
+#tmap_mode("view")
+#tm_shape(gambia.sf) + tm_dots("prev", title = "Prevalence") 
+```
+
+# Fitting Models
+
+```{r, warning=FALSE, message=FALSE}
+#### Fit models ####
+# Using Default Priors
+##### Complete pooling and altitude covariate (no random effect) #####
+formula1 <- prev ~ 1 + alt
+res1 <- inla(formula1, data = gambia.sf,
+            control.predictor = list(compute = TRUE),
+            control.compute = list(cpo=TRUE))
+
+##### Hierarchical random effect (iid) - (intercept only) #####
+# Include an unstructured component with index variable
+gambia.sf$idu <- 1:nrow(gambia.sf)
+gambia.sf$idv <- 1:nrow(gambia.sf)
+
+formula2 <- prev ~ 1 + f(idv, model = "iid")
+res2 <- inla(formula2, data = gambia.sf,
+            control.predictor = list(compute = TRUE),
+            control.compute = list(cpo=TRUE))
+
+##### Hierarchical random effect (iid) + altitude covariate #####
+formula3 <- prev ~ 1 + alt + f(idu, model = "iid") +
+  f(idv, alt, model = "iid")
+res3 <- inla(formula3, data = gambia.sf,
+            control.predictor = list(compute = TRUE),
+            control.compute = list(cpo=TRUE))
+
+##### Spatial + iid random effect ; Default Priors #####
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(d$long, d$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE with default priors
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+indexs <- inla.spde.make.index("s", spde$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = d$positive, numtrials = d$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = d$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+###### Model formula and inla call ######
+formula4.1 <- y ~ 0 + b0 + f(s, model = spde)
+
+res4.1 <- inla(formula4.1,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  ),
+  control.compute = list(cpo=TRUE)
+)
+
+##### Spatial + iid random effect ; PC Priors #####
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(d$long, d$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = d$positive, numtrials = d$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = d$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+###### Model formula and inla call ######
+formula4.2 <- y ~ 0 + b0 + f(s, model = spde.pc)
+
+res4.2 <- inla(formula4.2,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  ),
+  control.compute = list(cpo=TRUE)
+)
+
+
+##### Spatial + iid random effect + altitude covariate ; Default Priors #####
+## Mesh Construction 
+coo <- cbind(d$long, d$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE with default priors
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = d$positive, numtrials = d$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = d$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+###### Model formula and inla call ######
+formula5.1 <- y ~ 0 + b0 + altitude + f(s, model = spde)
+
+res5.1 <- inla(formula5.1,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  ),
+  control.compute = list(cpo=TRUE)
+)
+
+##### Spatial + iid random effect + altitude covariate; PC Priors #####
+## Mesh Construction
+coo <- cbind(d$long, d$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = d$positive, numtrials = d$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = d$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+###### Model formula and inla call ######
+formula5.2 <- y ~ 0 + b0 + altitude + f(s, model = spde.pc)
+
+res5.2 <- inla(formula5.2,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  ),
+  control.compute = list(cpo=TRUE)
+)
+```
+
+## CPO + PIT Values
+
+```{r}
+#### CPO + PIT values ####
+cpo1 <- data.frame(CPO = res1$cpo$cpo,
+                       PIT = res1$cpo$pit)
+cpo2 <- data.frame(CPO = res2$cpo$cpo,
+                       PIT = res2$cpo$pit)
+cpo3 <- data.frame(CPO = res3$cpo$cpo,
+                       PIT = res3$cpo$pit)
+cpo4.1 <- data.frame(CPO = res4.1$cpo$cpo,
+                       PIT = res4.1$cpo$pit)
+cpo4.2 <- data.frame(CPO = res4.2$cpo$cpo,
+                       PIT = res4.2$cpo$pit)
+cpo5.1 <- data.frame(CPO = res5.1$cpo$cpo,
+                       PIT = res5.1$cpo$pit)
+cpo5.2 <- data.frame(CPO = res5.2$cpo$cpo,
+                       PIT = res5.2$cpo$pit)
+cpo.total <- data.frame(cpo1,cpo2,cpo3,
+                        cpo4.1[1:65,],cpo4.2[1:65,],cpo5.1[1:65,],cpo5.2[1:65,])
+
+cpo.total |>
+  kable(
+    caption = "CPO and PIT values for each Model",
+    row.names = FALSE,
+    col.names = c("CPO","PIT","CPO","PIT","CPO",
+                  "PIT","CPO","PIT",
+                  "CPO","PIT","CPO",
+                  "PIT","CPO",
+                  "PIT"),
+    digits = 4,
+    booktabs = TRUE,
+    align = 'l'
+  ) |>
+  add_header_above(c("Complete Pool" = 2, "Hierarchical" = 2,
+                     "Hierchical+Alt" = 2, "Spatial+Default Priors" = 2,
+                     "Spatial+PC Priors" = 2, "Spatial+Alt+Default Priors" = 2,
+                     "Spatial+Alt+PC Priors" = 2))
+  
+```
+
+## Maps of Mean Predicted Prevalence and Its Bounds
+
+### Complete Pooling and Altitude (No Random)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of predicted prevalence and its bounds ####
+prev_mean <- res1$summary.fitted.values[,"mean"]
+prev_ll <- res1$summary.fitted.values[,"0.025quant"]
+prev_ul <- res1$summary.fitted.values[,"0.975quant"]
+
+##### Mean Predicted Prevalence #####
+r_prev_mean <- rasterize(x = coop, y = ra, field = prev_mean, fun = mean)
+
+pal <- colorNumeric("viridis", values(r_prev_mean), na.color = "transparent")
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addRasterImage(r_prev_mean, colors = pal, opacity = 0.5) |>
+  addLegend("bottomright", pal = pal, values = values(r_prev_mean), title = "Prevalence") |>
+  addScaleBar(position = c("bottomleft"))
+
+##### Lower Limit of Predicted Prevalence #####
+r_prev_ll <- rasterize(x = coop, y = ra, field = prev_ll, fun = mean)
+
+pal <- colorNumeric("viridis", values(r_prev_ll), na.color = "transparent")
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addRasterImage(r_prev_ll, colors = pal, opacity = 0.5) |>
+  addLegend("bottomright", pal = pal, values = values(r_prev_ll), title = "Lower Limit") |>
+  addScaleBar(position = c("bottomleft"))
+
+##### Upper Limit of Predicted Prevalence #####
+r_prev_ul <- rasterize(x = coop, y = ra, field = prev_ul, fun = mean)
+
+pal <- colorNumeric("viridis", values(r_prev_ul), na.color = "transparent")
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addRasterImage(r_prev_ul, colors = pal, opacity = 0.5) |>
+  addLegend("bottomright", pal = pal, values = values(r_prev_ul), title = "Upper Limit") |>
+  addScaleBar(position = c("bottomleft"))
+```
+
+### Hierarchical random effect (iid) - (intercept only)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of predicted prevalence and its bounds ####
+prev_mean <- res2$summary.fitted.values[,"mean"]
+prev_ll <- res2$summary.fitted.values[,"0.025quant"]
+prev_ul <- res2$summary.fitted.values[,"0.975quant"]
+
+##### Mean Predicted Prevalence #####
+r_prev_mean <- rasterize(x = coop, y = ra, field = prev_mean, fun = mean)
+
+pal <- colorNumeric("viridis", values(r_prev_mean), na.color = "transparent")
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addRasterImage(r_prev_mean, colors = pal, opacity = 0.5) |>
+  addLegend("bottomright", pal = pal, values = values(r_prev_mean), title = "Prevalence") |>
+  addScaleBar(position = c("bottomleft"))
+
+##### Lower Limit of Predicted Prevalence #####
+r_prev_ll <- rasterize(x = coop, y = ra, field = prev_ll, fun = mean)
+
+pal <- colorNumeric("viridis", values(r_prev_ll), na.color = "transparent")
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addRasterImage(r_prev_ll, colors = pal, opacity = 0.5) |>
+  addLegend("bottomright", pal = pal, values = values(r_prev_ll), title = "Lower Limit") |>
+  addScaleBar(position = c("bottomleft"))
+
+##### Upper Limit of Predicted Prevalence #####
+r_prev_ul <- rasterize(x = coop, y = ra, field = prev_ul, fun = mean)
+
+pal <- colorNumeric("viridis", values(r_prev_ul), na.color = "transparent")
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addRasterImage(r_prev_ul, colors = pal, opacity = 0.5) |>
+  addLegend("bottomright", pal = pal, values = values(r_prev_ul), title = "Upper Limit") |>
+  addScaleBar(position = c("bottomleft"))
+```
+
+### Hierarchical random effect (iid) + altitude covariate
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of predicted prevalence and its bounds ####
+prev_mean <- res3$summary.fitted.values[,"mean"]
+prev_ll <- res3$summary.fitted.values[,"0.025quant"]
+prev_ul <- res3$summary.fitted.values[,"0.975quant"]
+
+##### Mean Predicted Prevalence #####
+r_prev_mean <- rasterize(x = coop, y = ra, field = prev_mean, fun = mean)
+
+pal <- colorNumeric("viridis", values(r_prev_mean), na.color = "transparent")
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addRasterImage(r_prev_mean, colors = pal, opacity = 0.5) |>
+  addLegend("bottomright", pal = pal, values = values(r_prev_mean), title = "Prevalence") |>
+  addScaleBar(position = c("bottomleft"))
+
+##### Lower Limit of Predicted Prevalence #####
+r_prev_ll <- rasterize(x = coop, y = ra, field = prev_ll, fun = mean)
+
+pal <- colorNumeric("viridis", values(r_prev_ll), na.color = "transparent")
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addRasterImage(r_prev_ll, colors = pal, opacity = 0.5) |>
+  addLegend("bottomright", pal = pal, values = values(r_prev_ll), title = "Lower Limit") |>
+  addScaleBar(position = c("bottomleft"))
+
+##### Upper Limit of Predicted Prevalence #####
+r_prev_ul <- rasterize(x = coop, y = ra, field = prev_ul, fun = mean)
+
+pal <- colorNumeric("viridis", values(r_prev_ul), na.color = "transparent")
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addRasterImage(r_prev_ul, colors = pal, opacity = 0.5) |>
+  addLegend("bottomright", pal = pal, values = values(r_prev_ul), title = "Upper Limit") |>
+  addScaleBar(position = c("bottomleft"))
+```
+
+### Spatial + iid random effect (default priors)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of predicted prevalence and its bounds ####
+# Obtain indices of the stack that correspond to the predictions
+index <- inla.stack.index(stack = stk.full, tag = "pred")$data
+
+prev_mean <- res4.1$summary.fitted.values[index,"mean"]
+prev_ll <- res4.1$summary.fitted.values[index,"0.025quant"]
+prev_ul <- res4.1$summary.fitted.values[index,"0.975quant"]
+
+dpm <- rbind(
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_mean, variable = "prev_mean"
+  ),
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_ll, variable = "prev_ll"
+  ),
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_ul, variable = "prev_ul"
+  )
+)
+
+dpm$variable <- as.factor(dpm$variable)
+
+ggplot(dpm) + geom_tile(aes(long, lat, fill = value)) +
+  facet_wrap(~variable, nrow = 1) +
+  coord_fixed(ratio = 1) +
+  scale_fill_gradient(
+    name = "Prevalence",
+    low = "blue", high = "orange"
+  ) +
+  theme_bw()
+```
+
+### Spatial + iid random effect (penalized complexity priors)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of predicted prevalence and its bounds ####
+# Obtain indices of the stack that correspond to the predictions
+index <- inla.stack.index(stack = stk.full, tag = "pred")$data
+
+prev_mean <- res4.2$summary.fitted.values[index,"mean"]
+prev_ll <- res4.2$summary.fitted.values[index,"0.025quant"]
+prev_ul <- res4.2$summary.fitted.values[index,"0.975quant"]
+
+dpm <- rbind(
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_mean, variable = "prev_mean"
+  ),
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_ll, variable = "prev_ll"
+  ),
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_ul, variable = "prev_ul"
+  )
+)
+
+dpm$variable <- as.factor(dpm$variable)
+
+ggplot(dpm) + geom_tile(aes(long, lat, fill = value)) +
+  facet_wrap(~variable, nrow = 1) +
+  coord_fixed(ratio = 1) +
+  scale_fill_gradient(
+    name = "Prevalence",
+    low = "blue", high = "orange"
+  ) +
+  theme_bw()
+```
+
+### Spatial + iid random effect + altitude covariate (default priors)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of predicted prevalence and its bounds ####
+# Obtain indices of the stack that correspond to the predictions
+index <- inla.stack.index(stack = stk.full, tag = "pred")$data
+
+prev_mean <- res5.1$summary.fitted.values[index,"mean"]
+prev_ll <- res5.1$summary.fitted.values[index,"0.025quant"]
+prev_ul <- res5.1$summary.fitted.values[index,"0.975quant"]
+
+dpm <- rbind(
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_mean, variable = "prev_mean"
+  ),
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_ll, variable = "prev_ll"
+  ),
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_ul, variable = "prev_ul"
+  )
+)
+
+dpm$variable <- as.factor(dpm$variable)
+
+ggplot(dpm) + geom_tile(aes(long, lat, fill = value)) +
+  facet_wrap(~variable, nrow = 1) +
+  coord_fixed(ratio = 1) +
+  scale_fill_gradient(
+    name = "Prevalence",
+    low = "blue", high = "orange"
+  ) +
+  theme_bw()
+```
+
+### Spatial + iid random effect + altitude covariate (penalized complexity priors)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of predicted prevalence and its bounds ####
+# Obtain indices of the stack that correspond to the predictions
+index <- inla.stack.index(stack = stk.full, tag = "pred")$data
+
+prev_mean <- res5.1$summary.fitted.values[index,"mean"]
+prev_ll <- res5.1$summary.fitted.values[index,"0.025quant"]
+prev_ul <- res5.1$summary.fitted.values[index,"0.975quant"]
+
+dpm <- rbind(
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_mean, variable = "prev_mean"
+  ),
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_ll, variable = "prev_ll"
+  ),
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = prev_ul, variable = "prev_ul"
+  )
+)
+
+dpm$variable <- as.factor(dpm$variable)
+
+ggplot(dpm) + geom_tile(aes(long, lat, fill = value)) +
+  facet_wrap(~variable, nrow = 1) +
+  coord_fixed(ratio = 1) +
+  scale_fill_gradient(
+    name = "Prevalence",
+    low = "blue", high = "orange"
+  ) +
+  theme_bw()
+```
+
+Multiple penalized complexity priors were tested and the penalized complexity
+priors below are used:
+
+Prior.range: $Pr(\rho < 10) < 0.9$
+
+Prior.sigma: $Pr(\sigma < 1) < 0.01$
+
+These priors produced heatmaps where the spatial effect of the model is
+clearly visible and the prevalence bounds are not too extreme.
+Some other choices of priors yield heatmaps that were too extreme in
+either the predictions or the bound ranges.
+Therefore, the priors described above are used.
+
+The predicted prevalence of the complete pool and hierarchical models have
+very erratic predictions, but their predicted high prevalence areas mostly
+appear on the west and east ends of Gambia.
+
+The predicted prevalence of the spatial models differ in some areas; certain
+regions with low altitudes have clearly lower predicted prevalence in the
+spatial model that includes altitude as a covariate. Furthermore, both spatial
+models, regardless of priors, show higher predicted prevalence in the
+east end of Gambia, showing a clear spatial effect in
+the model for malaria prevalence.
+
+# Spatial Residuals
+
+For the models that include a spatial component, there is considerable change
+in residuals across different points on the map. Spatial variance is very high
+for the spatial models that do not include altitude as a covariate.
+
+For models that do not include a spatial component, the observed prevalence is
+much higher than the mean predicted prevalence in eastern regions of Gambia,
+while the opposite is true for western regions of the country. 
+This trend is apparent in all models that do not include a spatial component.
+This is
+indication for the need to include a spatial random effects term into the model.
+
+## Complete pooling and altitude (no random effects)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of observed prevalence - mean predicted prevalence ####
+prev_mean <- res1$summary.fitted.values[,"mean"]
+
+gambia.sf$prev_diff <- gambia.sf$prev - prev_mean
+
+res1.diff <- tm_shape(gambia.sf) + 
+  tm_dots("prev_diff") + 
+  tm_layout(main.title = "Observed Prevalence - Predicted Prevalence")
+
+tmap_mode("view")
+res1.diff
+```
+
+## Hierarchical random effect (iid) - (intercept only)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of observed prevalence - mean predicted prevalence ####
+prev_mean <- res2$summary.fitted.values[,"mean"]
+
+gambia.sf$prev_diff <- gambia.sf$prev - prev_mean
+
+res2.diff <- tm_shape(gambia.sf) + 
+  tm_dots("prev_diff") + 
+  tm_layout(main.title = "Observed Prevalence - Predicted Prevalence")
+
+tmap_mode("view")
+res2.diff
+```
+
+## Hierarchical random effect (iid) + altitude covariate
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of observed prevalence - mean predicted prevalence ####
+prev_mean <- res3$summary.fitted.values[,"mean"]
+
+gambia.sf$prev_diff <- gambia.sf$prev - prev_mean
+
+res3.diff <- tm_shape(gambia.sf) + 
+  tm_dots("prev_diff") + 
+  tm_layout(main.title = "Observed Prevalence - Predicted Prevalence")
+
+tmap_mode("view")
+res3.diff
+```
+
+## Spatial + iid random effect (default priors)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of observed prevalence - mean predicted prevalence ####
+# Obtain indices of the stack that correspond to the predictions
+index <- inla.stack.index(stack = stk.full, tag = "pred")$data
+
+prev_mean <- res4.1$summary.fitted.values[index,"mean"]
+
+dpm <- rbind(
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = gambia.sf$prev - prev_mean,
+    variable = "Observed Prevalence - Mean Predicted Prevalence"
+  )
+)
+
+dpm$variable <- as.factor(dpm$variable)
+
+ggplot(dpm) + geom_tile(aes(long, lat, fill = value)) +
+  facet_wrap(~variable, nrow = 1) +
+  coord_fixed(ratio = 1) +
+  scale_fill_gradient(
+    name = "prevalence diff",
+    low = "blue", high = "orange"
+  ) +
+  theme_bw()
+```
+
+## Spatial + iid random effect (penalized complexity priors)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of observed prevalence - mean predicted prevalence ####
+# Obtain indices of the stack that correspond to the predictions
+index <- inla.stack.index(stack = stk.full, tag = "pred")$data
+
+prev_mean <- res4.2$summary.fitted.values[index,"mean"]
+
+dpm <- rbind(
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = gambia.sf$prev - prev_mean,
+    variable = "Observed Prevalence - Mean Predicted Prevalence"
+  )
+)
+
+dpm$variable <- as.factor(dpm$variable)
+
+ggplot(dpm) + geom_tile(aes(long, lat, fill = value)) +
+  facet_wrap(~variable, nrow = 1) +
+  coord_fixed(ratio = 1) +
+  scale_fill_gradient(
+    name = "prevalence diff",
+    low = "blue", high = "orange"
+  ) +
+  theme_bw()
+```
+
+## Spatial + iid random effect + altitude covariate (default priors)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of observed prevalence - mean predicted prevalence ####
+# Obtain indices of the stack that correspond to the predictions
+index <- inla.stack.index(stack = stk.full, tag = "pred")$data
+
+prev_mean <- res5.1$summary.fitted.values[index,"mean"]
+
+dpm <- rbind(
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = gambia.sf$prev - prev_mean,
+    variable = "Observed Prevalence - Mean Predicted Prevalence"
+  )
+)
+
+dpm$variable <- as.factor(dpm$variable)
+
+ggplot(dpm) + geom_tile(aes(long, lat, fill = value)) +
+  facet_wrap(~variable, nrow = 1) +
+  coord_fixed(ratio = 1) +
+  scale_fill_gradient(
+    name = "prevalence diff",
+    low = "blue", high = "orange"
+  ) +
+  theme_bw()
+```
+
+## Spatial + iid random effect + altitude covariate (penalized complexity priors)
+
+```{r, warning=FALSE, message=FALSE}
+#### Create maps of observed prevalence - mean predicted prevalence ####
+# Obtain indices of the stack that correspond to the predictions
+index <- inla.stack.index(stack = stk.full, tag = "pred")$data
+
+prev_mean <- res5.2$summary.fitted.values[index,"mean"]
+
+dpm <- rbind(
+  data.frame(
+    long = coop[, 1], lat = coop[, 2],
+    value = gambia.sf$prev - prev_mean,
+    variable = "Observed Prevalence - Mean Predicted Prevalence"
+  )
+)
+
+dpm$variable <- as.factor(dpm$variable)
+
+ggplot(dpm) + geom_tile(aes(long, lat, fill = value)) +
+  facet_wrap(~variable, nrow = 1) +
+  coord_fixed(ratio = 1) +
+  scale_fill_gradient(
+    name = "prevalence diff",
+    low = "blue", high = "orange"
+  ) +
+  theme_bw()
+```
+
+# Results + PIT histograms
+
+```{r}
+#### Organize Results in a Table: Estimates and Credible Intervals ####
+##### Complete pooling and altitude (no random effects) #####
+table.res1 <- data.frame(LowerLimit = res1$summary.fixed$`0.025quant`,
+                       UpperLimit = res1$summary.fixed$`0.975quant`,
+                       Estimate = res1$summary.fixed$mean)
+rownames(table.res1)<- c("Model 1 Intercept","Model 1 Covariate")
+
+##### Hierarchical random effect (iid) - (intercept only) #####
+table.res2 <- data.frame(LowerLimit = res2$summary.fixed$`0.025quant`,
+                       UpperLimit = res2$summary.fixed$`0.975quant`,
+                       Estimate = res2$summary.fixed$mean)
+rownames(table.res2)<- c("Model 2 Intercept")
+
+##### Hierarchical random effect (iid) + altitude covariate #####
+table.res3 <- data.frame(LowerLimit = res3$summary.fixed$`0.025quant`,
+                       UpperLimit = res3$summary.fixed$`0.975quant`,
+                       Estimate = res3$summary.fixed$mean)
+rownames(table.res3)<- c("Model 3 Intercept","Model 3 Covariate")
+
+##### Spatial + iid random effect (default priors) #####
+table.res4.1 <- data.frame(LowerLimit = res4.1$summary.fixed$`0.025quant`,
+                       UpperLimit = res4.1$summary.fixed$`0.975quant`,
+                       Estimate = res4.1$summary.fixed$mean)
+rownames(table.res4.1)<- c("Model 4.1 Intercept")
+
+##### Spatial + iid random effect (pc priors) #####
+table.res4.2 <- data.frame(LowerLimit = res4.2$summary.fixed$`0.025quant`,
+                       UpperLimit = res4.2$summary.fixed$`0.975quant`,
+                       Estimate = res4.2$summary.fixed$mean)
+rownames(table.res4.2)<- c("Model 4.2 Intercept")
+
+##### Spatial + iid random effect + altitude covariate (default priors) #####
+table.res5.1 <- data.frame(LowerLimit = res5.1$summary.fixed$`0.025quant`,
+                       UpperLimit = res5.1$summary.fixed$`0.975quant`,
+                       Estimate = res5.1$summary.fixed$mean)
+rownames(table.res5.1)<- c("Model 5.1 Intercept","Model 5.1 Covariate")
+
+##### Spatial + iid random effect + altitude covariate (pc priors) #####
+table.res5.2 <- data.frame(LowerLimit = res5.2$summary.fixed$`0.025quant`,
+                       UpperLimit = res5.2$summary.fixed$`0.975quant`,
+                       Estimate = res5.2$summary.fixed$mean)
+rownames(table.res5.2)<- c("Model 5.2 Intercept","Model 5.2 Covariate")
+
+##### Merge all tables #####
+table.res <- bind_rows(table.res1, table.res2, table.res3, table.res4.1,
+                       table.res4.2, table.res5.1, table.res5.2)
+table.res %>%
+  kable(
+    caption = "Parameter Estimates and 95% Credible Intervals For All 7 Models",
+    col.names = c("Lower Bound", "Upper Bound", "Estimate"),
+    row.names = TRUE,
+    digits = 4,
+    booktabs = TRUE
+  )
+
+#### Organize Results in a Table: Sum of Log(CPO) ####
+sum_cpo1 <- sum(log(res1$cpo$cpo))
+sum_cpo2 <- sum(log(res2$cpo$cpo))
+sum_cpo3 <- sum(log(res3$cpo$cpo))
+sum_cpo4.1 <- sum(log(res4.1$cpo$cpo[1:65]))
+sum_cpo4.2 <- sum(log(res4.2$cpo$cpo[1:65]))
+sum_cpo5.1 <- sum(log(res5.1$cpo$cpo[1:65]))
+sum_cpo5.2 <- sum(log(res5.2$cpo$cpo[1:65]))
+
+sum_cpo <- t(data.frame(sum_cpo1, sum_cpo2, sum_cpo3, sum_cpo4.1, sum_cpo4.2,
+                        sum_cpo5.1, sum_cpo5.2))
+rownames(sum_cpo) <- c("Model 1", "Model 2", "Model 3", "Model 4.1",
+                       "Model 4.2", "Model 5.1", "Model 5.2")
+
+sum_cpo %>%
+  kable(
+    caption = "Sum of Log(CPO) for All 7 Models",
+    col.names = "Sum of Log(CPO)",
+    row.names = TRUE,
+  )
+
+```
+
+A smaller value of $-\sum log(CPO)$ points to a better model fit. Therefore,
+Model 2, Hierarchical random effect (iid) - (intercept only),
+is the model with the best fit. This is in line with the difference between
+observed prevalence and predicted prevalence as plotted in the Spatial Residuals
+section. Note that the model deemed to be the best fit via CPO does not include
+a spatial component, however we observed in previous segments that a spatial
+random effect seems to be present in the data. Therefore, low CPO may simply be
+a result of the model fitting the dataset well and is not indicative of the
+model's performance for data on a larger scale.
+
+```{r}
+#### Plot Histogram of the PIT values ####
+##### Model 1: Complete pooling and altitude (no random effects) #####
+pit1 <- data.frame(PIT = res1$cpo$pit)
+
+ggplot(data = pit1, aes(x=PIT)) + 
+  geom_histogram(binwidth=0.05, color="black", fill="lightblue") +
+  theme_classic() +
+  labs(title = "PIT Histogram for Complete Pooling (no random effects)")
+
+##### Model 2: Hierarchical random effect (iid) - (intercept only) #####
+pit2 <- data.frame(PIT = res2$cpo$pit)
+
+ggplot(data = pit2, aes(x=PIT)) + 
+  geom_histogram(binwidth=0.05, color="black", fill="lightblue") +
+  labs(title="PIT Histogram for Hierarchical random effect (iid) (intercept only)") +
+  theme_classic()
+
+##### Model 3: Hierarchical random effect (iid) + altitude covariate #####
+pit3 <- data.frame(PIT = res3$cpo$pit)
+
+ggplot(data = pit3, aes(x=PIT)) + 
+  geom_histogram(binwidth=0.05, color="black", fill="lightblue") +
+  labs(title="PIT Histogram for Hierarchical random effect (iid) + altitude covariate") +
+  theme_classic()
+
+##### Model 4.1: Spatial + iid random effect (default priors) #####
+pit4.1 <- data.frame(PIT = res4.1$cpo$pit[1:65])
+
+ggplot(data = pit4.1, aes(x=PIT)) + 
+  geom_histogram(binwidth=0.05, color="black", fill="lightblue") +
+  labs(title="PIT Histogram for Spatial + iid random effect (default priors)") +
+  theme_classic()
+
+##### Model 4.2: Spatial + iid random effect (pc priors) #####
+pit4.2 <- data.frame(PIT = res4.2$cpo$pit[1:65])
+
+ggplot(data = pit4.2, aes(x=PIT)) + 
+  geom_histogram(binwidth=0.05, color="black", fill="lightblue") +
+  labs(title="PIT Histogram for Spatial + iid random effect (pc priors)") +
+  theme_classic()
+
+##### Model 5.1: Spatial + iid random effect + altitude covariate (default priors) #####
+pit5.1 <- data.frame(PIT = res5.1$cpo$pit[1:65])
+
+ggplot(data = pit5.1, aes(x=PIT)) + 
+  geom_histogram(binwidth=0.05, color="black", fill="lightblue") +
+  labs(title="PIT Histogram for Spatial + iid random effect + altitude covariate (default priors)") +
+  theme_classic()
+
+##### Model 5.2: Spatial + iid random effect + altitude covariate (pc priors) #####
+pit5.2 <- data.frame(PIT = res5.2$cpo$pit[1:65])
+
+ggplot(data = pit5.2, aes(x=PIT)) + 
+  geom_histogram(binwidth=0.05, color="black", fill="lightblue") +
+  labs(title="PIT Histogram for Spatial + iid random effect + altitude covariate (pc priors)") +
+  theme_classic()
+```
+
+# Spatial K-fold CV
+
+```{r, warning=FALSE, message=FALSE}
+#### Perform 4-fold CV ####
+##### Parition the points based on Coordinates #####
+# partition for Kerewan
+part1 <- filter(gambia.sf, x > 363790 & x < 397080 & y > 1490500 & y < 1502000)
+# partition for Brikama
+part2 <- filter(gambia.sf, x > 349600 & x < 390500 & y > 1458000 & y < 1466500)
+# partition for JanJan Bureh
+part3 <- filter(gambia.sf, x > 486500 & x < 524000 & y > 1485000 & y < 1515000)
+# partition for Basse
+part4 <- filter(gambia.sf, x > 572000 & x < 622500 & y > 1467000 & y < 1500000)
+
+tm_shape(part1) + tm_dots("prev", col = "red") +
+  tm_layout(title = "Kerewan Partition")
+tm_shape(part2) + tm_dots("prev", col = "lightblue") +
+  tm_layout(title = "Brikama Partition")
+tm_shape(part3) + tm_dots("prev", col = "green") +
+  tm_layout(title = "JanJan Bureh Partition")
+tm_shape(part4) + tm_dots("prev", col = "yellow") +
+  tm_layout(title = "Basse Partition")
+
+# S is sample size
+S <- nrow(gambia.sf)
+
+##### Model 1: Complete pooling and altitude (no random effects) #####
+## First time
+# To predict points in Kerewan region, set the prev of points in the said region
+# to NA
+N <- nrow(part1)
+pred1 <- gambia.sf %>%
+  filter(x > 363790 & x < 397080 & y > 1490500 & y < 1502000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part2,part3,part4)
+
+res1.1 <- inla(formula1, data = pred1,
+            control.predictor = list(compute = TRUE))
+
+pred_mean1.1 <- res1.1$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta1.1 <- sum((part1$prev - pred_mean1.1*N)^2)/S
+
+## Second Time
+N <- nrow(part2)
+pred2 <- gambia.sf %>%
+  filter(x > 349600 & x < 390500 & y > 1458000 & y < 1466500) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part3,part4)
+  
+res1.2 <- inla(formula1, data = pred2,
+            control.predictor = list(compute = TRUE))
+
+pred_mean1.2 <- res1.2$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta1.2 <- sum((part2$prev - pred_mean1.2*N)^2)/S
+
+## Third time
+N <- nrow(part3)
+pred3 <- gambia.sf %>%
+  filter(x > 486500 & x < 524000 & y > 1485000 & y < 1515000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part4)
+  
+res1.3 <- inla(formula1, data = pred3,
+            control.predictor = list(compute = TRUE))
+
+pred_mean1.3 <- res1.3$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta1.3 <- sum((part3$prev - pred_mean1.3*N)^2)/S
+
+## Fourth time
+N <- nrow(part4)
+pred4 <- gambia.sf %>%
+  filter(x > 572000 & x < 622500 & y > 1467000 & y < 1500000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part3)
+  
+res1.4 <- inla(formula1, data = pred4,
+            control.predictor = list(compute = TRUE))
+
+pred_mean1.4 <- res1.4$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta1.4 <- sum((part3$prev - pred_mean1.4*N)^2)/S
+
+## Create a table for the Statistic
+sta1 <- data.frame(sta1 = sta1.1, sta2 = sta1.2,
+                   sta3 = sta1.3, sta4 = sta1.4)
+
+##### Model 2: Hierarchical random effect (iid) - (intercept only) #####
+## First time
+N <- nrow(part1)
+
+gambia.sf$idu <- 1:nrow(gambia.sf)
+gambia.sf$idv <- 1:nrow(gambia.sf)
+
+pred1 <- gambia.sf %>%
+  filter(x > 363790 & x < 397080 & y > 1490500 & y < 1502000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part2,part3,part4)
+
+
+res2.1 <- inla(formula2, data = pred1,
+            control.predictor = list(compute = TRUE),
+            control.compute = list(cpo=TRUE))
+
+pred_mean2.1 <- res2.1$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta2.1 <- sum((part1$prev - pred_mean2.1*N)^2)/S
+
+## Second Time
+N <- nrow(part2)
+pred2 <- gambia.sf %>%
+  filter(x > 349600 & x < 390500 & y > 1458000 & y < 1466500) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part3,part4)
+  
+res2.2 <- inla(formula2, data = pred2,
+            control.predictor = list(compute = TRUE),
+            control.compute = list(cpo=TRUE))
+
+pred_mean2.2 <- res2.2$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta2.2 <- sum((part2$prev - pred_mean2.2*N)^2)/S
+
+## Third time
+N <- nrow(part3)
+pred3 <- gambia.sf %>%
+  filter(x > 486500 & x < 524000 & y > 1485000 & y < 1515000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part4)
+  
+res2.3 <- inla(formula2, data = pred3,
+            control.predictor = list(compute = TRUE),
+            control.compute = list(cpo=TRUE))
+
+pred_mean2.3 <- res2.3$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta2.3 <- sum((part3$prev - pred_mean2.3*N)^2)/S
+
+## Fourth time
+N <- nrow(part4)
+pred4 <- gambia.sf %>%
+  filter(x > 572000 & x < 622500 & y > 1467000 & y < 1500000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part3)
+  
+res2.4 <- inla(formula2, data = pred4,
+            control.predictor = list(compute = TRUE),
+            control.compute = list(cpo=TRUE))
+
+pred_mean2.4 <- res2.4$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta2.4 <- sum((part3$prev - pred_mean2.4*N)^2)/S
+
+## Create a table for the Statistic
+sta2 <- data.frame(sta1 = sta2.1, sta2 = sta2.2,
+                   sta3 = sta2.3, sta4 = sta2.4)
+
+##### Model 3: Hierarchical random effect (iid) + altitude covariate #####
+## First time
+N <- nrow(part1)
+
+pred1 <- gambia.sf %>%
+  filter(x > 363790 & x < 397080 & y > 1490500 & y < 1502000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part2,part3,part4)
+
+res3.1 <- inla(formula3, data = pred1,
+            control.predictor = list(compute = TRUE))
+
+pred_mean3.1 <- res3.1$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta3.1 <- sum((part1$prev - pred_mean3.1*N)^2)/S
+
+## Second Time
+N <- nrow(part2)
+pred2 <- gambia.sf %>%
+  filter(x > 349600 & x < 390500 & y > 1458000 & y < 1466500) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part3,part4)
+  
+res3.2 <- inla(formula3, data = pred2,
+            control.predictor = list(compute = TRUE))
+
+pred_mean3.2 <- res3.2$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta3.2 <- sum((part2$prev - pred_mean3.2*N)^2)/S
+
+## Third time
+N <- nrow(part3)
+pred3 <- gambia.sf %>%
+  filter(x > 486500 & x < 524000 & y > 1485000 & y < 1515000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part4)
+  
+res3.3 <- inla(formula3, data = pred3,
+            control.predictor = list(compute = TRUE))
+
+pred_mean3.3 <- res3.3$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta3.3 <- sum((part3$prev - pred_mean3.3*N)^2)/S
+
+## Fourth time
+N <- nrow(part4)
+pred4 <- gambia.sf %>%
+  filter(x > 572000 & x < 622500 & y > 1467000 & y < 1500000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part3)
+  
+res3.4 <- inla(formula3, data = pred4,
+            control.predictor = list(compute = TRUE))
+
+pred_mean3.4 <- res3.4$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta3.4 <- sum((part3$prev - pred_mean3.4*N)^2)/S
+
+## Create a table for the Statistic
+sta3 <- data.frame(sta1 = sta2.1, sta2 = sta2.2,
+                   sta3 = sta2.3, sta4 = sta2.4)
+
+##### Model 4.1: Spatial + iid random effect (default priors) #####
+###### Parition the points based on Coordinates ######
+# partition for Kerewan
+part1 <- filter(d, x > 363790 & x < 397080 & y > 1490500 & y < 1502000)
+# partition for Brikama
+part2 <- filter(d, x > 349600 & x < 390500 & y > 1458000 & y < 1466500)
+# partition for JanJan Bureh
+part3 <- filter(d, x > 486500 & x < 524000 & y > 1485000 & y < 1515000)
+# partition for Basse
+part4 <- filter(d, x > 572000 & x < 622500 & y > 1467000 & y < 1500000)
+
+###### First Time ######
+N <- nrow(part1)
+
+pred1 <- d %>%
+  filter(x > 363790 & x < 397080 & y > 1490500 & y < 1502000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part2,part3,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred1$long, pred1$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+
+indexs <- inla.spde.make.index("s", spde$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred1$positive, numtrials = pred1$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred1$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res4.1.1 <- inla(formula4.1,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean4.1.1 <- res4.1.1$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta4.1.1 <- sum((part1$prev - pred_mean4.1.1*N)^2)/S
+
+###### Second Time ######
+N <- nrow(part2)
+pred2 <- d %>%
+  filter(x > 349600 & x < 390500 & y > 1458000 & y < 1466500) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part3,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred2$long, pred2$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+
+indexs <- inla.spde.make.index("s", spde$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred2$positive, numtrials = pred2$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred2$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res4.1.2 <- inla(formula4.1,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  )
+)  
+
+pred_mean4.1.2 <- res4.1.2$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta4.1.2 <- sum((part2$prev - pred_mean4.1.2*N)^2)/S
+
+###### Third Time ######
+N <- nrow(part3)
+pred3 <- d %>%
+  filter(x > 486500 & x < 524000 & y > 1485000 & y < 1515000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred3$long, pred3$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+indexs <- inla.spde.make.index("s", spde$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred3$positive, numtrials = pred3$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred3$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res4.1.3 <- inla(formula4.1,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  )
+) 
+
+pred_mean4.1.3 <- res4.1.3$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta4.1.3 <- sum((part3$prev - pred_mean4.1.3*N)^2)/S
+
+###### Fourth Time ######
+## Fourth time
+N <- nrow(part4)
+pred4 <- d %>%
+  filter(x > 572000 & x < 622500 & y > 1467000 & y < 1500000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part3)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred4$long, pred4$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+indexs <- inla.spde.make.index("s", spde$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred4$positive, numtrials = pred4$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred4$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res4.1.4 <- inla(formula4.1,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  )
+)  
+
+pred_mean4.1.4 <- res4.1.4$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta4.1.4 <- sum((part3$prev - pred_mean4.1.4*N)^2)/S
+
+## Create a table for the Statistic
+sta4.1 <- data.frame(sta1 = sta4.1.1, sta2 = sta4.1.2,
+                   sta3 = sta4.1.3, sta4 = sta4.1.4)
+
+##### Model 4.2: Spatial + iid random effect (pc priors) #####
+###### First Time ######
+N <- nrow(part1)
+
+pred1 <- d %>%
+  filter(x > 363790 & x < 397080 & y > 1490500 & y < 1502000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part2,part3,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred1$long, pred1$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred1$positive, numtrials = pred1$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred1$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res4.2.1 <- inla(formula4.2,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean4.2.1 <- res4.2.1$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta4.2.1 <- sum((part1$prev - pred_mean4.2.1*N)^2)/S
+
+###### Second Time ######
+N <- nrow(part2)
+pred2 <- d %>%
+  filter(x > 349600 & x < 390500 & y > 1458000 & y < 1466500) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part3,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred2$long, pred2$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred2$positive, numtrials = pred2$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred2$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res4.2.2 <- inla(formula4.2,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  )
+)  
+
+pred_mean4.2.2 <- res4.2.2$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta4.2.2 <- sum((part2$prev - pred_mean4.2.2*N)^2)/S
+
+###### Third Time ######
+N <- nrow(part3)
+pred3 <- d %>%
+  filter(x > 486500 & x < 524000 & y > 1485000 & y < 1515000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred3$long, pred3$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred3$positive, numtrials = pred3$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred3$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res4.2.3 <- inla(formula4.2,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  )
+) 
+
+pred_mean4.2.3 <- res4.2.3$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta4.2.3 <- sum((part3$prev - pred_mean4.2.3*N)^2)/S
+
+###### Fourth Time ######
+## Fourth time
+N <- nrow(part4)
+pred4 <- d %>%
+  filter(x > 572000 & x < 622500 & y > 1467000 & y < 1500000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part3)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred4$long, pred4$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred4$positive, numtrials = pred4$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred4$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res4.2.4 <- inla(formula4.2,
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE,
+    A = inla.stack.A(stk.full)
+  )
+)  
+
+pred_mean4.2.4 <- res4.1.4$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta4.2.4 <- sum((part3$prev - pred_mean4.2.4*N)^2)/S
+
+## Create a table for the Statistic
+sta4.2 <- data.frame(sta1 = sta4.2.1, sta2 = sta4.2.2,
+                   sta3 = sta4.2.3, sta4 = sta4.2.4)
+
+##### Model 5.1: Spatial + iid random effect + altitude covariate (default priors) #####
+###### First Time ######
+N <- nrow(part1)
+pred1 <- d %>%
+  filter(x > 363790 & x < 397080 & y > 1490500 & y < 1502000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part2,part3,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred1$long, pred1$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+indexs <- inla.spde.make.index("s", spde$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred1$positive, numtrials = pred1$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred1$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res5.1.1 <- inla(formula5.1,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean5.1.1 <- res5.1.1$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta5.1.1 <- sum((part1$prev - pred_mean5.1.1*N)^2)/S
+
+###### Second Time ######
+N <- nrow(part2)
+pred2 <- d %>%
+  filter(x > 349600 & x < 390500 & y > 1458000 & y < 1466500) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part3,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred2$long, pred2$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+indexs <- inla.spde.make.index("s", spde$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred2$positive, numtrials = pred2$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred2$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res5.1.2 <- inla(formula5.1,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean5.1.2 <- res5.1.2$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta5.1.2 <- sum((part2$prev - pred_mean5.1.2*N)^2)/S
+
+###### Third Time ######
+N <- nrow(part3)
+pred3 <- d %>%
+  filter(x > 486500 & x < 524000 & y > 1485000 & y < 1515000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred3$long, pred3$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+indexs <- inla.spde.make.index("s", spde$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred3$positive, numtrials = pred3$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred3$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res5.1.3 <- inla(formula5.1,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean5.1.3 <- res5.1.3$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta5.1.3 <- sum((part3$prev - pred_mean5.1.3*N)^2)/S
+
+###### Fourth Time ######
+## Fourth time
+N <- nrow(part4)
+pred4 <- d %>%
+  filter(x > 572000 & x < 622500 & y > 1467000 & y < 1500000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part3)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred4$long, pred4$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+spde <- inla.spde2.matern(mesh = mesh, alpha = 2, constr = TRUE)
+
+indexs <- inla.spde.make.index("s", spde$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred4$positive, numtrials = pred4$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred4$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res5.1.4 <- inla(formula5.1,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean5.1.4 <- res5.1.4$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta5.1.4 <- sum((part3$prev - pred_mean5.1.4*N)^2)/S
+
+## Create a table for the Statistic
+sta5.1 <- data.frame(sta1 = sta5.1.1, sta2 = sta5.1.2,
+                   sta3 = sta5.1.3, sta4 = sta5.1.4)
+
+##### Model 5.2: Spatial + iid random effect + altitude covariate (pc priors) #####
+###### First Time ######
+N <- nrow(part1)
+pred1 <- d %>%
+  filter(x > 363790 & x < 397080 & y > 1490500 & y < 1502000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part2,part3,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred1$long, pred1$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred1$positive, numtrials = pred1$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred1$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res5.2.1 <- inla(formula5.2,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean5.2.1 <- res5.2.1$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta5.2.1 <- sum((part1$prev - pred_mean5.2.1*N)^2)/S
+
+###### Second Time ######
+N <- nrow(part2)
+pred2 <- d %>%
+  filter(x > 349600 & x < 390500 & y > 1458000 & y < 1466500) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part3,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred2$long, pred2$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred2$positive, numtrials = pred2$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred2$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res5.2.2 <- inla(formula5.2,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean5.2.2 <- res5.2.2$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta5.2.2 <- sum((part2$prev - pred_mean5.2.2*N)^2)/S
+
+###### Third Time ######
+N <- nrow(part3)
+pred3 <- d %>%
+  filter(x > 486500 & x < 524000 & y > 1485000 & y < 1515000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part4)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred3$long, pred3$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred3$positive, numtrials = pred3$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred3$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res5.2.3 <- inla(formula5.2,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean5.2.3 <- res5.2.3$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta5.2.3 <- sum((part3$prev - pred_mean5.2.3*N)^2)/S
+
+###### Fourth Time ######
+## Fourth time
+N <- nrow(part4)
+pred4 <- d %>%
+  filter(x > 572000 & x < 622500 & y > 1467000 & y < 1500000) %>%
+  mutate(prev = NA) %>%
+  bind_rows(part1,part2,part3)
+
+## Mesh Construction 
+# Code modified from MalariaPrevalence.Rmd in Lab 7
+coo <- cbind(pred4$long, pred4$lat)
+mesh <- inla.mesh.2d(
+  loc = coo, max.edge = c(0.1, 5),
+  cutoff = 0.01
+)
+
+## Construct "A" projection matrices
+# SPDE2 Matérn with penalized complexity priors
+spde.pc <- inla.spde2.pcmatern(mesh = mesh, alpha = 2, constr = TRUE, 
+                            prior.range = c(10, 0.9), prior.sigma = c(1, 0.01))
+
+indexs <- inla.spde.make.index("s", spde.pc$n.spde)
+A <- inla.spde.make.A(mesh = mesh, loc = coo)
+
+## Prediction data
+dp <- rasterToPoints(r)
+ra <- aggregate(r, fact = 5, fun = mean)
+dp <- rasterToPoints(ra)
+coop <- dp[, c("x", "y")]
+Ap <- inla.spde.make.A(mesh = mesh, loc = coop)
+
+## stack for estimation stk.e
+stk.e <- inla.stack(
+  tag = "est",
+  data = list(y = pred4$positive, numtrials = pred4$total),
+  A = list(1, A),
+  effects = list(data.frame(b0 = 1, altitude = pred4$alt), s = indexs)
+)
+
+# stack for prediction stk.p
+stk.p <- inla.stack(
+  tag = "pred",
+  data = list(y = NA, numtrials = NA),
+  A = list(1, Ap),
+  effects = list(data.frame(b0 = 1, altitude = dp[, 3]),
+    s = indexs
+  )
+)
+
+# stk.full has stk.e and stk.p
+stk.full <- inla.stack(stk.e, stk.p)
+
+## Model formula and inla call
+res5.2.4 <- inla(formula5.2,
+  family = "binomial", Ntrials = numtrials,
+  control.family = list(link = "logit"),
+  data = inla.stack.data(stk.full),
+  control.predictor = list(
+    compute = TRUE, link = 1,
+    A = inla.stack.A(stk.full)
+  )
+)
+
+pred_mean5.2.4 <- res5.2.4$summary.fitted.values[1:N, "mean"]
+# Calculate (1/S) (sum(y_i - \hat(y_i))^2)
+sta5.2.4 <- sum((part3$prev - pred_mean5.2.4*N)^2)/S
+
+## Create a table for the Statistic
+sta5.2 <- data.frame(sta1 = sta5.2.1, sta2 = sta5.2.2,
+                   sta3 = sta5.2.3, sta4 = sta5.2.4)
+
+sta_total <- rbind(sta1, sta2, sta3, sta4.1, sta4.2, sta5.1, sta5.2)
+
+rownames(sta_total) <- c("Model 1","Model 2","Model 3","Model 4.1",
+                         "Model 4.2","Model 5.1","Model 5.2")
+
+sta_total |>
+  kable(
+    caption = "Computed Statistics for each of the 4 folds For All 7 Models",
+    col.names = c("Kere Partition","Brik Partition","JanJan Partition"
+                  ,"Basse Partition"),
+    row.names = TRUE,
+    digits = 4,
+    booktabs = TRUE
+  )
+```
+
+The Results in this section does seem to match the results from CPO; it
+seems Model 2 is the best in terms of predictive capacity.
+However, Model 5.2 performs
+better than Model 2 in every partition except the Basse partition.
+No major differences in predictive capacity can be observed when comparing CPO
+and 4-fold CV across models.
+
+# Choice of Model
+
+I would choose Model 5.2.
+While Model 2 has the best predictive performance as indicated by its CPO, the
+map of estimates for Model 2 also shows that a spatial effect can be observed
+in the prevalence of Malaria in Gambia, meaning that a spatial component
+should be included in the final model.
+Additionally, Model 5.2 has better predictive capacity than Model 2 in 3
+out of the 4 folds for the 4-fold CV.
+
+The only concern about my choice of model is its unusual
+$\frac{1}{S}\sum(y_i - \hat y_i)^2$ value in the Basse partition.
+
+# Reference
+
+- Asidianya, N, (2022, March 16) Lab Lecture #7. Quercus. https://q.utoronto.ca/
+
+- Barajas, V. Leos, (2022, April 1) Lecture11 [PDF]. Quercus. https://q.utoronto.ca/
+
+- Gómez-Rubio, V. (2021, August 29). Bayesian inference with INLA. Chapter 4 Multilevel Models. Retrieved April 30, 2022, from https://becarioprecario.bitbucket.io/inla-gitbook/ch-multilevel.html 
+
+- Moraga, P. (2019). Geospatial Health Data: Modeling and Visualization with R-INLA and Shiny. Chapman & Hall/CRC Biostatistics Series. Retrieved April 30, 2022, from http://www.paulamoraga.com/book-geospatial
+
